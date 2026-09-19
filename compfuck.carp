@@ -5,9 +5,9 @@
       (inc (search-matching-bracket (String.tail s) (if (= \] f) (dec m) (if (= \[ f) (inc m) m)))))))
 
 (defndynamic compile-compf-char [c s i]
-  (case f
-    \+ (list 1 '(Array.aupdate! &t h &(fn [x] (mod (Int.inc @x) 255))))
-    \- (list 1 '(Array.aupdate! &t h &(fn [x] (max 0 (Int.dec @x)))))
+  (case c
+    \+ (list 1 '(Array.aupdate! &t h &(fn [x] (mod (Int.inc x) 255))))
+    \- (list 1 '(Array.aupdate! &t h &(fn [x] (max 0 (Int.dec x)))))
     \> (list 1 '(set! h (+ h 1)))
     \< (list 1 '(set! h (- h 1)))
     \. (list 1 '(IO.print &(str (Char.from-int (copy (Array.unsafe-nth &t h))))))
@@ -17,7 +17,7 @@
         (list (+ end 1)
           `(while (/= &0 (Array.unsafe-nth &t h))
             (do
-              %@(let [subs (String.slice s (+ i 1) end)]
+              %@(let [subs (String.slice s (+ i 1) (+ i end))]
                   (compile-compf subs 0))))))
     '(1 ())))
 
@@ -35,8 +35,7 @@
                                  (+ i incr)))))))))
 
 (defmacro compf [prog]
-  (eval
-    `(defn main []
-      (let-do [t (Array.replicate 30000 &0)
-               h 0]
-        %@(compile-compf prog 0)))))
+  `(defn main []
+    (let-do [t (Array.replicate 30000 &0)
+             h 0]
+      %@(compile-compf prog 0))))
