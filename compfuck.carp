@@ -1,41 +1,68 @@
-(defndynamic search-matching-bracket [s m]
-  (if (or (= (String.length s) 0) (= m 0))
-    0
-    (let [f (String.char-at s 0)]
-      (inc (search-matching-bracket (String.tail s) (if (= \] f) (dec m) (if (= \[ f) (inc m) m)))))))
+; Keep the interpreter's source before Carp expands and type-checks it.
+(defmacro definterpreter [name args body]
+  `(do
+    (defn %name %args %body)
+    (meta-set! %name "source" %body)))
 
-(defndynamic compile-compf-char [c s i]
-  (case c
-    \+ (list 1 '(Array.aupdate! &t h &(fn [x] (mod (Int.inc x) 255))))
-    \- (list 1 '(Array.aupdate! &t h &(fn [x] (max 0 (Int.dec x)))))
-    \> (list 1 '(set! h (+ h 1)))
-    \< (list 1 '(set! h (- h 1)))
-    \. (list 1 '(IO.print &(str (Char.from-int (copy (Array.unsafe-nth &t h))))))
-    \, (list 1 '(Array.aset! &t h (Char.to-int (IO.get-char))))
-    \[
-      (let [end (search-matching-bracket (String.suffix s (+ i 1)) 1)]
-        (list (+ end 1)
-          `(while (/= &0 (Array.unsafe-nth &t h))
-            (do
-              %@(let [subs (String.slice s (+ i 1) (+ i end))]
-                  (compile-compf subs 0))))))
-    '(1 ())))
+; The same bracket scan is needed at runtime and at compile time.
+(defmacro defstatic [name args body]
+  `(do
+    (defn %name %args %body)
+    (defmodule Dynamic (defndynamic %name %args %body))))
+
+(defstatic search-matching-bracket [s i m]
+  (if (or (= i (String.length s)) (= m 0))
+    i
+    (let [f (String.char-at s i)]
+      (search-matching-bracket s (inc i)
+        (if (= f \]) (dec m) (if (= f \[) (inc m) m))))))
+
+(definterpreter interpret-compf [p i t h]
+  (if (= i (String.length p))
+    h
+    (let [f (String.char-at p i)]
+      (if (= f \])
+        h
+        (let [incr (if (= f \[) (- (search-matching-bracket p (inc i) 1) i) 1)]
+          (do
+            (case f
+              \+ (Array.aupdate! t h &(fn [x] (mod (Int.inc x) 255)))
+              \- (Array.aupdate! t h &(fn [x] (max 0 (Int.dec x))))
+              \> (set! h (+ h 1))
+              \< (set! h (- h 1))
+              \. (IO.print &(str (Char.from-int (copy (Array.unsafe-nth t h)))))
+              \, (Array.aset! t h (IO.Raw.get-char))
+              \[ (while (/= &0 (Array.unsafe-nth t h))
+                   (set! h (interpret-compf p (inc i) t h)))
+              ())
+            (interpret-compf p (+ i incr) t h)))))))
+
+; p/i and the single-binding let/if/case forms are static.
+; t/h and while conditions are dynamic; recursive calls pass t unchanged.
+(defndynamic specialize-compf [body expression bindings]
+  (let [known (fn [form] (eval (list 'let bindings form)))
+        recur (fn [form] (specialize-compf body form bindings))]
+    (if (or (not (list? expression)) (empty? expression))
+      expression
+      (case (car expression)
+        'if (recur (if (known (cadr expression)) (caddr expression) (cadddr expression)))
+        'let (specialize-compf body (caddr expression)
+               (append bindings (array (car (cadr expression)) (known (cadr (cadr expression))))))
+        'case (recur (case-internal (known (cadr expression)) (cddr expression)))
+        'interpret-compf
+          (let [saved (gensym)]
+            `(let [%saved %(last expression) h %saved]
+              %(specialize-compf body body
+                (array 'p (known (cadr expression)) 'i (known (caddr expression))))))
+        (map recur expression)))))
 
 (defndynamic compile-compf [p i]
-  (if (= i (String.length p))
-    '()
-    (let [f (String.char-at p i)]
-      (if (= \] f)
-        '()
-        (let [incr-c (compile-compf-char f p i)]
-          (let [incr (car incr-c)
-                compiled (cadr incr-c)]
-            (cons compiled
-                  (compile-compf p
-                                 (+ i incr)))))))))
+  (let [body (meta interpret-compf "source")]
+    (specialize-compf body body (array 'p p 'i i))))
 
 (defmacro compf [prog]
   `(defn main []
-    (let-do [t (Array.replicate 30000 &0)
-             h 0]
-      %@(compile-compf prog 0))))
+    (let [tape (Array.replicate 30000 &0)
+          t &tape
+          h 0]
+      (ignore %(compile-compf prog 0)))))
