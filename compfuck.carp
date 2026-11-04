@@ -1,41 +1,222 @@
-(defndynamic search-matching-bracket [s m]
-  (if (or (= (String.length s) 0) (= m 0))
-    0
-    (let [f (String.char-at s 0)]
-      (inc (search-matching-bracket (String.tail s) (if (= \] f) (dec m) (if (= \[ f) (inc m) m)))))))
+(defmacro remember [name args body]
+  `(do
+    (meta-set! %name "args" %args)
+    (meta-set! %name "source" %body)))
 
-(defndynamic compile-compf-char [c s i]
-  (case c
-    \+ (list 1 '(Array.aupdate! &t h &(fn [x] (mod (Int.inc x) 255))))
-    \- (list 1 '(Array.aupdate! &t h &(fn [x] (max 0 (Int.dec x)))))
-    \> (list 1 '(set! h (+ h 1)))
-    \< (list 1 '(set! h (- h 1)))
-    \. (list 1 '(IO.print &(str (Char.from-int (copy (Array.unsafe-nth &t h))))))
-    \, (list 1 '(Array.aset! &t h (Char.to-int (IO.get-char))))
-    \[
-      (let [end (search-matching-bracket (String.suffix s (+ i 1)) 1)]
-        (list (+ end 1)
-          `(while (/= &0 (Array.unsafe-nth &t h))
-            (do
-              %@(let [subs (String.slice s (+ i 1) (+ i end))]
-                  (compile-compf subs 0))))))
-    '(1 ())))
+(defndynamic source-of [name]
+  (list name
+        (collect-into (eval (list 'meta name "args")) list)
+        (eval (list 'meta name "source"))))
 
-(defndynamic compile-compf [p i]
+(remember search-matching-bracket [s i m]
+  (if (or (= i (String.length s)) (= m 0))
+    i
+    (let [f (String.char-at s i)]
+      (search-matching-bracket s (inc i)
+        (if (= f \]) (dec m) (if (= f \[) (inc m) m))))))
+
+(remember interpret-compf [p i t h]
   (if (= i (String.length p))
-    '()
+    h
     (let [f (String.char-at p i)]
-      (if (= \] f)
-        '()
-        (let [incr-c (compile-compf-char f p i)]
-          (let [incr (car incr-c)
-                compiled (cadr incr-c)]
-            (cons compiled
-                  (compile-compf p
-                                 (+ i incr)))))))))
+      (if (= f \])
+        h
+        (let [incr (if (= f \[) (- (search-matching-bracket p (inc i) 1) i) 1)]
+          (do
+            (case f
+              \+ (Array.aupdate! t h &(fn [x] (mod (Int.inc x) 255)))
+              \- (Array.aupdate! t h &(fn [x] (max 0 (Int.dec x))))
+              \> (set! h (+ h 1))
+              \< (set! h (- h 1))
+              \. (IO.print &(str (Char.from-int (copy (Array.unsafe-nth t h)))))
+              \, (Array.aset! t h (IO.Raw.get-char))
+              \[ (while (/= &0 (Array.unsafe-nth t h))
+                   (set! h (interpret-compf p (inc i) t h)))
+              ())
+            (interpret-compf p (+ i incr) t h)))))))
+
+(defndynamic lift [v]
+  (if (or (symbol? v) (and (list? v) (not (empty? v))))
+    (list 'quote v)
+    v))
+
+(defndynamic memo [x] x)
+
+(defdynamic residual-names '())
+(defdynamic residual-defs '())
+
+(defndynamic residual [prog f names vals]
+  (let [key (list (car f) names vals)
+        found (filter (fn [entry] (= (car entry) key)) residual-names)]
+    (if (empty? found)
+      (let [name (gensym-with (car f))
+            dyn (dynamic-params (cadr f) names)]
+        (do
+          (set! residual-names (cons (list key name) residual-names))
+          (set! residual-defs
+            (cons (list name (collect-into dyn array) (mix prog dyn (caddr f) names vals))
+                  residual-defs))
+          name))
+      (cadr (car found)))))
+
+(defdynamic mix-functions '())
+
+(defmacro defmix [name args body]
+  (do
+    (set! mix-functions (cons name mix-functions))
+    `(do
+      (defndynamic %name %args %body)
+      (remember %name %args %body))))
+
+(defndynamic mix-source []
+  (map source-of mix-functions))
+
+(defmix member? [x xs]
+  (cond
+    (empty? xs) false
+    (= x (car xs)) true
+    (member? x (cdr xs))))
+
+(defmix index-of [x xs]
+  (if (= x (car xs)) 0 (inc (index-of x (cdr xs)))))
+
+(defmix lookup [f prog]
+  (cond
+    (empty? prog) '()
+    (= f (car (car prog))) (car prog)
+    (lookup f (cdr prog))))
+
+(defmix mentions? [e syms]
+  (cond
+    (symbol? e) (member? e syms)
+    (or (list? e) (array? e))
+      (if (empty? e) false (or (mentions? (car e) syms) (mentions? (cdr e) syms)))
+    false))
+
+(defmix static-params [params args dyn]
+  (cond
+    (empty? params) '()
+    (mentions? (car args) dyn) (static-params (cdr params) (cdr args) dyn)
+    (cons (car params) (static-params (cdr params) (cdr args) dyn))))
+
+(defmix dynamic-params [params names]
+  (cond
+    (empty? params) '()
+    (member? (car params) names) (dynamic-params (cdr params) names)
+    (cons (car params) (dynamic-params (cdr params) names))))
+
+(defmix ev [prog e names vals]
+  (cond
+    (symbol? e) (List.nth vals (index-of e names))
+    (not (list? e)) e
+    (= (car e) 'quote) (cadr e)
+    (= (car e) 'if)
+      (if (ev prog (cadr e) names vals) (ev prog (caddr e) names vals) (ev prog (cadddr e) names vals))
+    (= (car e) 'let)
+      (ev prog (caddr e) (cons (car (cadr e)) names) (cons (ev prog (cadr (cadr e)) names vals) vals))
+    (empty? (lookup (car e) prog)) (ev-primitive prog e names vals)
+    (memo (ev prog (caddr (lookup (car e) prog)) (cadr (lookup (car e) prog))
+              (ev-each prog (cdr e) names vals)))))
+
+(defmix ev-each [prog es names vals]
+  (if (empty? es)
+    '()
+    (cons (ev prog (car es) names vals) (ev-each prog (cdr es) names vals))))
+
+(defmix ev-primitive [prog e names vals]
+  (cond
+    (= (car e) 'car) (car (ev prog (cadr e) names vals))
+    (= (car e) 'cdr) (cdr (ev prog (cadr e) names vals))
+    (= (car e) 'cadr) (cadr (ev prog (cadr e) names vals))
+    (= (car e) 'caddr) (caddr (ev prog (cadr e) names vals))
+    (= (car e) 'cadddr) (cadddr (ev prog (cadr e) names vals))
+    (= (car e) 'cons) (cons (ev prog (cadr e) names vals) (ev prog (caddr e) names vals))
+    (= (car e) 'empty?) (empty? (ev prog (cadr e) names vals))
+    (= (car e) 'symbol?) (symbol? (ev prog (cadr e) names vals))
+    (= (car e) 'list?) (list? (ev prog (cadr e) names vals))
+    (= (car e) 'array?) (array? (ev prog (cadr e) names vals))
+    (= (car e) 'not) (not (ev prog (cadr e) names vals))
+    (= (car e) '=) (= (ev prog (cadr e) names vals) (ev prog (caddr e) names vals))
+    (= (car e) '+) (+ (ev prog (cadr e) names vals) (ev prog (caddr e) names vals))
+    (= (car e) '-) (- (ev prog (cadr e) names vals) (ev prog (caddr e) names vals))
+    (= (car e) 'inc) (inc (ev prog (cadr e) names vals))
+    (= (car e) 'dec) (dec (ev prog (cadr e) names vals))
+    (= (car e) 'String.length) (String.length (ev prog (cadr e) names vals))
+    (= (car e) 'String.char-at)
+      (String.char-at (ev prog (cadr e) names vals) (ev prog (caddr e) names vals))
+    (macro-error (str "unknown primitive " (car e)))))
+
+(defmix mix [prog dyn e names vals]
+  (cond
+    (not (mentions? e names)) e
+    (not (mentions? e dyn)) (lift (ev prog e names vals))
+    (and (= (car e) 'if) (not (mentions? (cadr e) dyn)))
+      (if (ev prog (cadr e) names vals)
+        (mix prog dyn (caddr e) names vals)
+        (mix prog dyn (cadddr e) names vals))
+    (= (car e) 'let)
+      (mix prog dyn (caddr e)
+        (cons (car (cadr e)) names)
+        (cons (ev prog (cadr (cadr e)) names vals) vals))
+    (= (car e) 'memo) (mix-memo prog dyn (cadr e) names vals)
+    (empty? (lookup (car e) prog)) (mix-each prog dyn e names vals)
+    (unfold prog dyn (lookup (car e) prog) (cdr e) (cadr (lookup (car e) prog)) (cdr e) names vals)))
+
+(defmix mix-each [prog dyn es names vals]
+  (if (empty? es)
+    '()
+    (cons (mix prog dyn (car es) names vals) (mix-each prog dyn (cdr es) names vals))))
+
+(defmix static-args [prog args dyn names vals]
+  (cond
+    (empty? args) '()
+    (mentions? (car args) dyn) (static-args prog (cdr args) dyn names vals)
+    (cons (ev prog (car args) names vals) (static-args prog (cdr args) dyn names vals))))
+
+(defmix dynamic-args [prog dyn args names vals]
+  (cond
+    (empty? args) '()
+    (mentions? (car args) dyn)
+      (cons (mix prog dyn (car args) names vals) (dynamic-args prog dyn (cdr args) names vals))
+    (dynamic-args prog dyn (cdr args) names vals)))
+
+(defmix unfold [prog dyn f args params rest names vals]
+  (cond
+    (empty? params)
+      (let [static (static-params (cadr f) args dyn)]
+        (memo (mix prog (dynamic-params (cadr f) static) (caddr f) static
+                   (static-args prog args dyn names vals))))
+    (or (not (mentions? (car rest) dyn)) (= (car params) (car rest)))
+      (unfold prog dyn f args (cdr params) (cdr rest) names vals)
+    (list 'let (array (car params) (mix prog dyn (car rest) names vals))
+      (unfold prog dyn f args (cdr params) (cdr rest) names vals))))
+
+(defmix mix-memo [prog dyn call names vals]
+  (let [f (lookup (car call) prog)]
+    (cons (residual prog f
+                    (static-params (cadr f) (cdr call) dyn)
+                    (static-args prog (cdr call) dyn names vals))
+          (dynamic-args prog dyn (cdr call) names vals))))
+
+(defndynamic define-residual [def]
+  (eval (list 'defndynamic (car def) (cadr def) (caddr def))))
+
+(defdynamic interpreter
+  (list (source-of 'interpret-compf) (source-of 'search-matching-bracket)))
+
+(defdynamic compf-compiler
+  (let [specializer (mix-source)]
+    (residual specializer (lookup 'mix specializer) '(prog dyn e names)
+      (list interpreter '(t h) (caddr (car interpreter)) '(p i)))))
+
+(map define-residual residual-defs)
+
+(defndynamic compile-compf [p]
+  (eval (list compf-compiler (list 'quote (list p 0)))))
 
 (defmacro compf [prog]
   `(defn main []
-    (let-do [t (Array.replicate 30000 &0)
-             h 0]
-      %@(compile-compf prog 0))))
+    (let [tape (Array.replicate 30000 &0)
+          t &tape
+          h 0]
+      (ignore %(compile-compf prog)))))
